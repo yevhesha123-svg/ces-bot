@@ -39,10 +39,13 @@ SYSTEM_PROMPT = """Ти — асистент подкасту «Що з екон
 
 і так далі."""
 
+# Max chars per chunk sent to Claude (~15k = ~4k tokens, safe limit)
+CHUNK_SIZE = 15000
+
 
 async def call_claude(text: str) -> str:
-    """Call Anthropic API to process transcript."""
-    async with httpx.AsyncClient(timeout=120) as client:
+    """Call Anthropic API to process one chunk of transcript."""
+    async with httpx.AsyncClient(timeout=180) as client:
         response = await client.post(
             "https://api.anthropic.com/v1/messages",
             headers={
@@ -74,6 +77,25 @@ async def call_claude(text: str) -> str:
         return data["content"][0]["text"]
 
 
+def split_into_chunks(text: str, chunk_size: int = CHUNK_SIZE) -> list[str]:
+    """Split text into chunks, trying to break at paragraph boundaries."""
+    chunks = []
+    while text:
+        if len(text) <= chunk_size:
+            chunks.append(text)
+            break
+        # Try to split at double newline (paragraph)
+        split_at = text.rfind('\n\n', 0, chunk_size)
+        if split_at == -1:
+            # Fall back to single newline
+            split_at = text.rfind('\n', 0, chunk_size)
+        if split_at == -1:
+            split_at = chunk_size
+        chunks.append(text[:split_at])
+        text = text[split_at:].lstrip()
+    return chunks
+
+
 async def fetch_url_text(url: str) -> str:
     """Fetch text content from a URL."""
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
@@ -81,7 +103,7 @@ async def fetch_url_text(url: str) -> str:
         r.raise_for_status()
         text = re.sub(r'<[^>]+>', ' ', r.text)
         text = re.sub(r'\s+', ' ', text).strip()
-        return text[:30000]
+        return text
 
 
 def extract_pdf_text(file_bytes: bytes) -> str:
@@ -93,6 +115,29 @@ def extract_pdf_text(file_bytes: bytes) -> str:
             if t:
                 text_parts.append(t)
     return "\n".join(text_parts)
+
+
+async def process_and_send(update: Update, raw_text: str):
+    """Split text into chunks, process each with Claude, send results."""
+    chunks = split_into_chunks(raw_text)
+    total = len(chunks)
+
+    if total > 1:
+        await update.message.reply_text(
+            f"📋 Текст великий — розбиваю на {total} частини і обробляю кожну окремо..."
+        )
+
+    for i, chunk in enumerate(chunks, 1):
+        if total > 1:
+            await update.message.reply_text(f"⏳ Обробляю частину {i}/{total}...")
+        try:
+            result = await call_claude(chunk)
+        except Exception as e:
+            await update.message.reply_text(
+                f"❌ Помилка на частині {i}/{total}: {type(e).__name__}: {e}"
+            )
+            return
+        await send_long_message(update, result)
 
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
@@ -115,7 +160,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Надішліть PDF або TXT файл з транскриптом.")
         return
 
-    await update.message.reply_text("⏳ Обробляю файл, зачекайте...")
+    await update.message.reply_text("⏳ Читаю файл...")
 
     file = await context.bot.get_file(doc.file_id)
     file_bytes = await file.download_as_bytearray()
@@ -133,17 +178,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Файл не містить тексту.")
         return
 
-    if len(raw_text) > 30000:
-        raw_text = raw_text[:30000]
-        await update.message.reply_text("⚠️ Файл дуже довгий — обробляю перші 30 000 символів.")
-
-    try:
-        result = await call_claude(raw_text)
-    except Exception as e:
-        await update.message.reply_text(f"❌ Помилка Claude API: {type(e).__name__}: {e}")
-        return
-
-    await send_long_message(update, result)
+    await process_and_send(update, raw_text)
 
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -161,15 +196,8 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Не вдалося завантажити сторінку: {e}")
         return
 
-    await update.message.reply_text("✅ Сторінку завантажено. Обробляю текст...")
-
-    try:
-        result = await call_claude(raw_text)
-    except Exception as e:
-        await update.message.reply_text(f"❌ Помилка Claude API: {type(e).__name__}: {e}")
-        return
-
-    await send_long_message(update, result)
+    await update.message.reply_text("✅ Завантажено. Обробляю...")
+    await process_and_send(update, raw_text)
 
 
 async def send_long_message(update: Update, text: str):
