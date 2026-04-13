@@ -39,12 +39,10 @@ SYSTEM_PROMPT = """Ти — асистент подкасту «Що з екон
 
 і так далі."""
 
-# Max chars per chunk sent to Claude (~15k = ~4k tokens, safe limit)
 CHUNK_SIZE = 15000
 
 
 async def call_claude(text: str) -> str:
-    """Call Anthropic API to process one chunk of transcript."""
     async with httpx.AsyncClient(timeout=180) as client:
         response = await client.post(
             "https://api.anthropic.com/v1/messages",
@@ -66,28 +64,22 @@ async def call_claude(text: str) -> str:
             }
         )
         data = response.json()
-
         if response.status_code != 200:
             error_msg = data.get("error", {}).get("message", str(data))
             raise ValueError(f"Anthropic API error {response.status_code}: {error_msg}")
-
         if "content" not in data:
             raise ValueError(f"Unexpected API response: {data}")
-
         return data["content"][0]["text"]
 
 
 def split_into_chunks(text: str, chunk_size: int = CHUNK_SIZE) -> list[str]:
-    """Split text into chunks, trying to break at paragraph boundaries."""
     chunks = []
     while text:
         if len(text) <= chunk_size:
             chunks.append(text)
             break
-        # Try to split at double newline (paragraph)
         split_at = text.rfind('\n\n', 0, chunk_size)
         if split_at == -1:
-            # Fall back to single newline
             split_at = text.rfind('\n', 0, chunk_size)
         if split_at == -1:
             split_at = chunk_size
@@ -97,7 +89,6 @@ def split_into_chunks(text: str, chunk_size: int = CHUNK_SIZE) -> list[str]:
 
 
 async def fetch_url_text(url: str) -> str:
-    """Fetch text content from a URL."""
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
         r.raise_for_status()
@@ -107,7 +98,6 @@ async def fetch_url_text(url: str) -> str:
 
 
 def extract_pdf_text(file_bytes: bytes) -> str:
-    """Extract text from PDF bytes."""
     text_parts = []
     with pdfplumber.open(BytesIO(file_bytes)) as pdf:
         for page in pdf.pages:
@@ -117,8 +107,17 @@ def extract_pdf_text(file_bytes: bytes) -> str:
     return "\n".join(text_parts)
 
 
-async def process_and_send(update: Update, raw_text: str):
-    """Split text into chunks, process each with Claude, send results."""
+async def send_as_file(update: Update, text: str, filename: str):
+    """Send result as a .txt file so formatting is preserved for copy-paste."""
+    file_bytes = text.encode("utf-8")
+    await update.message.reply_document(
+        document=BytesIO(file_bytes),
+        filename=filename,
+        caption="✅ Готово! Відкрийте файл і скопіюйте текст на сайт ЦЕС."
+    )
+
+
+async def process_and_send(update: Update, raw_text: str, source_name: str = "transcript"):
     chunks = split_into_chunks(raw_text)
     total = len(chunks)
 
@@ -127,17 +126,24 @@ async def process_and_send(update: Update, raw_text: str):
             f"📋 Текст великий — розбиваю на {total} частини і обробляю кожну окремо..."
         )
 
+    all_results = []
+
     for i, chunk in enumerate(chunks, 1):
         if total > 1:
             await update.message.reply_text(f"⏳ Обробляю частину {i}/{total}...")
         try:
             result = await call_claude(chunk)
+            all_results.append(result)
         except Exception as e:
             await update.message.reply_text(
                 f"❌ Помилка на частині {i}/{total}: {type(e).__name__}: {e}"
             )
             return
-        await send_long_message(update, result)
+
+    # Combine all parts and send as one file
+    full_text = "\n\n".join(all_results)
+    filename = source_name.replace(".pdf", "").replace(".txt", "") + "_відредаговано.txt"
+    await send_as_file(update, full_text, filename)
 
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
@@ -148,7 +154,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Надішли мені:\n"
         "📄 PDF або TXT файл з транскриптом\n"
         "🔗 Посилання на сторінку з текстом (наприклад, ces.org.ua)\n\n"
-        "Я відредагую текст у форматі для публікації на сайті ЦЕС."
+        "Я відредагую текст і поверну готовий файл для публікації на сайті ЦЕС."
     )
 
 
@@ -178,7 +184,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Файл не містить тексту.")
         return
 
-    await process_and_send(update, raw_text)
+    await process_and_send(update, raw_text, source_name=doc.file_name)
 
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -197,31 +203,8 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text("✅ Завантажено. Обробляю...")
-    await process_and_send(update, raw_text)
-
-
-async def send_long_message(update: Update, text: str):
-    """Send message, splitting if over Telegram's 4096 char limit."""
-    chunk_size = 4000
-    if len(text) <= chunk_size:
-        await update.message.reply_text(text)
-        return
-
-    parts = []
-    while text:
-        if len(text) <= chunk_size:
-            parts.append(text)
-            break
-        split_at = text.rfind('\n', 0, chunk_size)
-        if split_at == -1:
-            split_at = chunk_size
-        parts.append(text[:split_at])
-        text = text[split_at:].lstrip()
-
-    for i, part in enumerate(parts, 1):
-        await update.message.reply_text(
-            f"📝 Частина {i}/{len(parts)}:\n\n{part}"
-        )
+    slug = re.sub(r'https?://', '', url).replace('/', '_')[:40]
+    await process_and_send(update, raw_text, source_name=slug)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
