@@ -40,11 +40,15 @@ SYSTEM_PROMPT = """Ти — асистент подкасту «Що з екон
 і так далі."""
 
 CHUNK_SIZE = 15000
+# How many chars to accumulate before updating the live message
+STREAM_UPDATE_EVERY = 300
 
 
-async def call_claude(text: str) -> str:
-    async with httpx.AsyncClient(timeout=180) as client:
-        response = await client.post(
+async def call_claude_streaming(text: str, on_chunk) -> str:
+    """Call Anthropic API with streaming. Calls on_chunk(delta) for each text piece."""
+    async with httpx.AsyncClient(timeout=300) as client:
+        async with client.stream(
+            "POST",
             "https://api.anthropic.com/v1/messages",
             headers={
                 "x-api-key": ANTHROPIC_API_KEY,
@@ -54,6 +58,7 @@ async def call_claude(text: str) -> str:
             json={
                 "model": "claude-sonnet-4-6",
                 "max_tokens": 8192,
+                "stream": True,
                 "system": SYSTEM_PROMPT,
                 "messages": [
                     {
@@ -62,14 +67,31 @@ async def call_claude(text: str) -> str:
                     }
                 ]
             }
-        )
-        data = response.json()
-        if response.status_code != 200:
-            error_msg = data.get("error", {}).get("message", str(data))
-            raise ValueError(f"Anthropic API error {response.status_code}: {error_msg}")
-        if "content" not in data:
-            raise ValueError(f"Unexpected API response: {data}")
-        return data["content"][0]["text"]
+        ) as response:
+            if response.status_code != 200:
+                body = await response.aread()
+                data = __import__('json').loads(body)
+                error_msg = data.get("error", {}).get("message", str(data))
+                raise ValueError(f"Anthropic API error {response.status_code}: {error_msg}")
+
+            full_text = ""
+            async for line in response.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                payload = line[6:]
+                if payload == "[DONE]":
+                    break
+                try:
+                    event = __import__('json').loads(payload)
+                except Exception:
+                    continue
+                if event.get("type") == "content_block_delta":
+                    delta = event.get("delta", {}).get("text", "")
+                    if delta:
+                        full_text += delta
+                        await on_chunk(delta)
+
+            return full_text
 
 
 def split_into_chunks(text: str, chunk_size: int = CHUNK_SIZE) -> list[str]:
@@ -108,7 +130,7 @@ def extract_pdf_text(file_bytes: bytes) -> str:
 
 
 async def send_as_file(update: Update, text: str, filename: str):
-    """Send result as a .txt file so formatting is preserved for copy-paste."""
+    """Send final result as a downloadable .txt file."""
     file_bytes = text.encode("utf-8")
     await update.message.reply_document(
         document=BytesIO(file_bytes),
@@ -118,31 +140,65 @@ async def send_as_file(update: Update, text: str, filename: str):
 
 
 async def process_and_send(update: Update, raw_text: str, source_name: str = "transcript"):
+    """Process text with streaming — user sees live progress, gets file at the end."""
     chunks = split_into_chunks(raw_text)
     total = len(chunks)
+    all_results = []
 
     if total > 1:
         await update.message.reply_text(
             f"📋 Текст великий — розбиваю на {total} частини і обробляю кожну окремо..."
         )
 
-    all_results = []
-
     for i, chunk in enumerate(chunks, 1):
-        if total > 1:
-            await update.message.reply_text(f"⏳ Обробляю частину {i}/{total}...")
+        label = f"частина {i}/{total}" if total > 1 else "транскрипт"
+
+        # Send initial "thinking" message
+        live_msg = await update.message.reply_text(
+            f"✍️ Редагую {label}...\n\n_(текст з'явиться тут)_",
+            parse_mode="Markdown"
+        )
+
+        accumulated = ""   # buffer for live updates
+        full_result = ""   # complete result for this chunk
+        chars_since_update = 0
+
+        async def on_chunk(delta: str):
+            nonlocal accumulated, full_result, chars_since_update
+            full_result += delta
+            accumulated += delta
+            chars_since_update += len(delta)
+
+            # Update live message every STREAM_UPDATE_EVERY chars
+            if chars_since_update >= STREAM_UPDATE_EVERY:
+                preview = full_result[-1500:] if len(full_result) > 1500 else full_result
+                try:
+                    await live_msg.edit_text(
+                        f"✍️ Редагую {label}...\n\n{preview}",
+                    )
+                except Exception:
+                    pass  # ignore edit errors (e.g. message not modified)
+                chars_since_update = 0
+
         try:
-            result = await call_claude(chunk)
-            all_results.append(result)
+            full_result = await call_claude_streaming(chunk, on_chunk)
+            all_results.append(full_result)
         except Exception as e:
             await update.message.reply_text(
-                f"❌ Помилка на частині {i}/{total}: {type(e).__name__}: {e}"
+                f"❌ Помилка на {label}: {type(e).__name__}: {e}"
             )
             return
 
-    # Combine all parts and send as one file
+        # Final update for this chunk
+        try:
+            preview = full_result[-1500:] if len(full_result) > 1500 else full_result
+            await live_msg.edit_text(f"✅ {label.capitalize()} готова!\n\n{preview}")
+        except Exception:
+            pass
+
+    # Send everything as one file
     full_text = "\n\n".join(all_results)
-    filename = source_name.replace(".pdf", "").replace(".txt", "") + "_відредаговано.txt"
+    filename = re.sub(r'[^\w\-.]', '_', source_name.replace(".pdf", "").replace(".txt", "")) + "_відредаговано.txt"
     await send_as_file(update, full_text, filename)
 
 
@@ -154,7 +210,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Надішли мені:\n"
         "📄 PDF або TXT файл з транскриптом\n"
         "🔗 Посилання на сторінку з текстом (наприклад, ces.org.ua)\n\n"
-        "Я відредагую текст і поверну готовий файл для публікації на сайті ЦЕС."
+        "Я відредагую текст у реальному часі і поверну готовий файл для публікації на сайті ЦЕС."
     )
 
 
