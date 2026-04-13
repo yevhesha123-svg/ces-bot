@@ -129,13 +129,33 @@ def extract_pdf_text(file_bytes: bytes) -> str:
     return "\n".join(text_parts)
 
 
+def markdown_to_html(text: str) -> str:
+    """Convert **bold** markdown to HTML."""
+    lines = text.split("\n")
+    html_lines = []
+    for line in lines:
+        line = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", line)
+        if line.strip():
+            html_lines.append(f"<p>{line}</p>")
+        else:
+            html_lines.append("<br>")
+    body = "\n".join(html_lines)
+    return f"""<!DOCTYPE html>
+<html lang="uk">
+<head><meta charset="UTF-8">
+<style>body{{font-family:Arial,sans-serif;font-size:15px;line-height:1.7;max-width:800px;margin:40px auto;padding:0 20px;color:#222}}p{{margin:0 0 8px 0}}</style>
+</head><body>{body}</body></html>"""
+
+
 async def send_as_file(update: Update, text: str, filename: str):
-    """Send final result as a downloadable .txt file."""
-    file_bytes = text.encode("utf-8")
+    """Send final result as HTML file with bold formatting."""
+    html_content = markdown_to_html(text)
+    file_bytes = html_content.encode("utf-8")
+    html_filename = filename.replace(".txt", ".html")
     await update.message.reply_document(
         document=BytesIO(file_bytes),
-        filename=filename,
-        caption="✅ Готово! Відкрийте файл і скопіюйте текст на сайт ЦЕС."
+        filename=html_filename,
+        caption="✅ Готово! Відкрийте файл у браузері та скопіюйте текст на сайт ЦЕС — імена спікерів вже жирним."
     )
 
 
