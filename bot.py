@@ -64,7 +64,6 @@ async def call_claude(text: str) -> str:
         )
         data = response.json()
 
-        # Show exact error from Anthropic if something went wrong
         if response.status_code != 200:
             error_msg = data.get("error", {}).get("message", str(data))
             raise ValueError(f"Anthropic API error {response.status_code}: {error_msg}")
@@ -80,10 +79,9 @@ async def fetch_url_text(url: str) -> str:
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
         r.raise_for_status()
-        # Very basic HTML stripping
         text = re.sub(r'<[^>]+>', ' ', r.text)
         text = re.sub(r'\s+', ' ', text).strip()
-        return text[:15000]  # limit to avoid token overflow
+        return text[:30000]
 
 
 def extract_pdf_text(file_bytes: bytes) -> str:
@@ -103,41 +101,48 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Привіт! Я бот ЦЕС для підготовки транскриптів подкасту.\n\n"
         "Надішли мені:\n"
-        "📄 *PDF-файл* з транскриптом\n"
-        "🔗 *Посилання* на сторінку з текстом (наприклад, ces.org.ua)\n\n"
-        "Я відредагую текст у форматі для публікації на сайті ЦЕС.",
-        parse_mode="Markdown"
+        "📄 PDF або TXT файл з транскриптом\n"
+        "🔗 Посилання на сторінку з текстом (наприклад, ces.org.ua)\n\n"
+        "Я відредагую текст у форматі для публікації на сайті ЦЕС."
     )
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
-    if not doc.file_name.lower().endswith(".pdf"):
-        await update.message.reply_text("⚠️ Поки що підтримуються лише PDF-файли.")
+    fname = doc.file_name.lower()
+
+    if not fname.endswith(".pdf") and not fname.endswith(".txt"):
+        await update.message.reply_text("⚠️ Надішліть PDF або TXT файл з транскриптом.")
         return
 
-    await update.message.reply_text("⏳ Обробляю PDF, зачекайте...")
+    await update.message.reply_text("⏳ Обробляю файл, зачекайте...")
 
     file = await context.bot.get_file(doc.file_id)
     file_bytes = await file.download_as_bytearray()
 
     try:
-        raw_text = extract_pdf_text(bytes(file_bytes))
+        if fname.endswith(".txt"):
+            raw_text = bytes(file_bytes).decode("utf-8", errors="ignore")
+        else:
+            raw_text = extract_pdf_text(bytes(file_bytes))
     except Exception as e:
-        await update.message.reply_text(f"❌ Не вдалося прочитати PDF: {e}")
+        await update.message.reply_text(f"❌ Не вдалося прочитати файл: {e}")
         return
 
     if not raw_text.strip():
-        await update.message.reply_text("❌ PDF не містить тексту (можливо, це скан).")
+        await update.message.reply_text("❌ Файл не містить тексту.")
         return
+
+    if len(raw_text) > 30000:
+        raw_text = raw_text[:30000]
+        await update.message.reply_text("⚠️ Файл дуже довгий — обробляю перші 30 000 символів.")
 
     try:
         result = await call_claude(raw_text)
     except Exception as e:
-        await update.message.reply_text(f"❌ Помилка Claude API: {e}")
+        await update.message.reply_text(f"❌ Помилка Claude API: {type(e).__name__}: {e}")
         return
 
-    # Send in chunks if too long
     await send_long_message(update, result)
 
 
@@ -161,7 +166,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         result = await call_claude(raw_text)
     except Exception as e:
-        await update.message.reply_text(f"❌ Помилка Claude API: {e}")
+        await update.message.reply_text(f"❌ Помилка Claude API: {type(e).__name__}: {e}")
         return
 
     await send_long_message(update, result)
@@ -179,7 +184,6 @@ async def send_long_message(update: Update, text: str):
         if len(text) <= chunk_size:
             parts.append(text)
             break
-        # Try to split at newline
         split_at = text.rfind('\n', 0, chunk_size)
         if split_at == -1:
             split_at = chunk_size
