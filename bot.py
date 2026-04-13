@@ -191,8 +191,20 @@ async def fetch_url_text(url: str) -> str:
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
         r.raise_for_status()
-        text = re.sub(r'<[^>]+>', ' ', r.text)
-        text = re.sub(r'\s+', ' ', text).strip()
+        html = r.text
+        # Strip scripts, styles, nav, footer
+        html = re.sub(r"(?is)<script[^>]*>.*?</script>", " ", html)
+        html = re.sub(r"(?is)<style[^>]*>.*?</style>", " ", html)
+        html = re.sub(r"(?is)<nav[^>]*>.*?</nav>", " ", html)
+        html = re.sub(r"(?is)<footer[^>]*>.*?</footer>", " ", html)
+        html = re.sub(r"(?is)<header[^>]*>.*?</header>", " ", html)
+        # Try to get article content
+        m = re.search(r"(?is)<article[^>]*>(.*?)</article>", html)
+        if m:
+            html = m.group(1)
+        # Strip remaining tags
+        text = re.sub(r"<[^>]+>", " ", html)
+        text = re.sub(r"\s+", " ", text).strip()
         return text
 
 
