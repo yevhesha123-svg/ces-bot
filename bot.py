@@ -2,6 +2,7 @@ import os
 import re
 import json
 import logging
+import asyncio
 import httpx
 import pdfplumber
 from io import BytesIO
@@ -97,13 +98,14 @@ TRANSCRIPT_SYSTEM = """Ти — асистент подкасту «Що з ек
 **Ім'я Прізвище:** Текст репліки"""
 
 CHUNK_SIZE = 15000
-STREAM_UPDATE_EVERY = 300
+STREAM_UPDATE_EVERY = 600
 
 
 # ── Claude API calls ───────────────────────────────────────────────────────────
 
 async def call_claude_streaming(system: str, user_message: str, on_chunk) -> str:
-    async with httpx.AsyncClient(timeout=300) as client:
+    """Call Claude API. Streams response and periodically calls on_chunk."""
+    async with httpx.AsyncClient(timeout=httpx.Timeout(300, connect=30)) as client:
         async with client.stream(
             "POST",
             "https://api.anthropic.com/v1/messages",
@@ -127,6 +129,7 @@ async def call_claude_streaming(system: str, user_message: str, on_chunk) -> str
                 raise ValueError(f"Anthropic API error {response.status_code}: {error_msg}")
 
             full_text = ""
+            buffer = ""
             async for line in response.aiter_lines():
                 if not line.startswith("data: "):
                     continue
@@ -141,7 +144,13 @@ async def call_claude_streaming(system: str, user_message: str, on_chunk) -> str
                     delta = event.get("delta", {}).get("text", "")
                     if delta:
                         full_text += delta
-                        await on_chunk(delta)
+                        buffer += delta
+                        if len(buffer) >= STREAM_UPDATE_EVERY:
+                            try:
+                                await asyncio.wait_for(on_chunk(delta), timeout=5)
+                            except Exception:
+                                pass
+                            buffer = ""
             return full_text
 
 
@@ -671,7 +680,13 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app = (ApplicationBuilder()
+            .token(TELEGRAM_TOKEN)
+            .connect_timeout(30)
+            .read_timeout(60)
+            .write_timeout(60)
+            .pool_timeout(30)
+            .build())
 
     # Longread conversation
     longread_handler = ConversationHandler(
